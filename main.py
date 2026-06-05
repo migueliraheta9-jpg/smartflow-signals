@@ -1,6 +1,9 @@
 import os
 import logging
+import json
 import requests
+import psycopg2
+import psycopg2.extras
 from flask import Flask, request, jsonify
 from datetime import datetime
 import hmac
@@ -12,6 +15,7 @@ logger = logging.getLogger(__name__)
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
+DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
 KZ_EMOJIS = {
@@ -31,6 +35,135 @@ TIPO_EMOJIS = {
     "fvg":      "📦 FVG H1",
     "liquidez": "💧 Toma de Liquidez",
 }
+
+# ═══════════════════════════════════════════════════════════
+#  DATABASE — PostgreSQL (nuevo en Fase 1)
+# ═══════════════════════════════════════════════════════════
+
+def get_db_connection():
+    """Abre conexión a PostgreSQL con timeout de 10s. Retorna None si falla."""
+    if not DATABASE_URL:
+        return None
+    try:
+        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    except Exception as e:
+        logger.error(f"Error conectando a DB: {e}")
+        return None
+
+def init_db():
+    """Crea la tabla signals si no existe. Idempotente — seguro de ejecutar múltiples veces."""
+    if not DATABASE_URL:
+        logger.warning("DATABASE_URL no configurada — persistencia deshabilitada, bot funcionará igual.")
+        return
+    conn = get_db_connection()
+    if not conn:
+        logger.error("No se pudo inicializar DB (conexión falló) — bot funcionará sin persistencia.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signals (
+                    id              SERIAL PRIMARY KEY,
+                    received_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    tipo_msg        TEXT NOT NULL DEFAULT 'signal',
+                    par             TEXT,
+                    direccion       TEXT,
+                    ciclo           TEXT,
+                    kz              TEXT,
+                    tipo            TEXT,
+                    fvg_src         TEXT,
+                    calidad         TEXT,
+                    cierre_fuerte   TEXT,
+                    vela_comp       TEXT,
+                    vic_robusta     TEXT,
+                    daily           TEXT,
+                    ops_asia        INTEGER,
+                    ops_lon         INTEGER,
+                    ops_ny          INTEGER,
+                    pendientes      INTEGER,
+                    sl              TEXT,
+                    dist_obj        TEXT,
+                    precio          TEXT,
+                    raw_payload     JSONB
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_received_at ON signals(received_at DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_par ON signals(par);")
+            conn.commit()
+            logger.info("Base de datos inicializada — tabla 'signals' lista.")
+    except Exception as e:
+        logger.error(f"Error inicializando DB: {e}")
+    finally:
+        conn.close()
+
+def safe_int(val, default=0):
+    """Convierte un valor a int de forma segura. Retorna default si falla."""
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return default
+
+def save_event_to_db(data: dict, tipo_msg: str) -> bool:
+    """Inserta el evento recibido en la tabla signals.
+    Retorna True si tuvo éxito, False si falló.
+    NUNCA lanza excepción al caller — el bot debe seguir funcionando aunque la DB falle."""
+    if not DATABASE_URL:
+        return False
+    conn = get_db_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO signals (
+                    tipo_msg, par, direccion, ciclo, kz, tipo, fvg_src, calidad,
+                    cierre_fuerte, vela_comp, vic_robusta, daily,
+                    ops_asia, ops_lon, ops_ny, pendientes,
+                    sl, dist_obj, precio, raw_payload
+                ) VALUES (
+                    %s, %s, %s, %s, %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s,
+                    %s, %s, %s, %s
+                )
+            """, (
+                tipo_msg,
+                data.get("par"),
+                data.get("direccion"),
+                data.get("ciclo"),
+                data.get("kz"),
+                data.get("tipo"),
+                data.get("fvg_src"),
+                data.get("calidad"),
+                data.get("cierre_fuerte"),
+                data.get("vela_comp"),
+                data.get("vic_robusta"),
+                data.get("daily"),
+                safe_int(data.get("ops_asia")),
+                safe_int(data.get("ops_lon")),
+                safe_int(data.get("ops_ny")),
+                safe_int(data.get("pendientes")),
+                data.get("sl"),
+                data.get("dist_obj"),
+                data.get("precio"),
+                json.dumps(data),
+            ))
+            conn.commit()
+            logger.info(f"Evento '{tipo_msg}' guardado en DB.")
+            return True
+    except Exception as e:
+        logger.error(f"Error guardando en DB: {e}")
+        return False
+    finally:
+        conn.close()
+
+# Inicializar DB al cargar el módulo (compatible con gunicorn).
+# Se ejecutará una vez por worker. CREATE TABLE IF NOT EXISTS es idempotente.
+init_db()
+
+# ═══════════════════════════════════════════════════════════
+#  TELEGRAM — sin cambios respecto a la versión anterior
+# ═══════════════════════════════════════════════════════════
 
 def send_telegram(message: str) -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -137,6 +270,10 @@ def format_fin_dia(data: dict) -> str:
 """.strip()
     return msg
 
+# ═══════════════════════════════════════════════════════════
+#  ENDPOINTS
+# ═══════════════════════════════════════════════════════════
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not validate_secret(request):
@@ -146,13 +283,20 @@ def webhook():
     data = request.get_json(silent=True)
     if not data:
         try:
-            import json
             data = json.loads(request.data.decode("utf-8"))
         except Exception:
             return jsonify({"error": "Invalid payload"}), 400
 
     logger.info(f"Payload recibido: {data}")
     tipo = data.get("tipo_msg", "signal")
+
+    # ─── Guardado en DB ANTES de Telegram ──────────────────
+    # Doble try/except — la DB nunca puede romper el envío a Telegram
+    try:
+        save_event_to_db(data, tipo)
+    except Exception as e:
+        logger.error(f"Error inesperado al guardar en DB: {e}")
+    # ───────────────────────────────────────────────────────
 
     if tipo == "fin_dia":
         message = format_fin_dia(data)
@@ -175,6 +319,41 @@ def test():
     msg = "🔔 <b>SmartFlow v3.0 — Prueba de conexión</b>\n━━━━━━━━━━━━━━━━━━━━━\n✅ Servidor activo y conectado.\n🤖 Las alertas de TradingView llegarán aquí."
     success = send_telegram(msg)
     return (jsonify({"status": "ok", "message": "Prueba enviada"}), 200) if success else (jsonify({"status": "error"}), 500)
+
+# ─── NUEVO: endpoint para consultar señales guardadas ────
+@app.route("/signals", methods=["GET"])
+def list_signals():
+    """Retorna las últimas 100 señales guardadas en formato JSON."""
+    if not DATABASE_URL:
+        return jsonify({"error": "Database not configured"}), 503
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Database connection failed"}), 503
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT 
+                    id, received_at, tipo_msg, par, direccion, ciclo, kz, tipo,
+                    fvg_src, calidad, cierre_fuerte, vela_comp, vic_robusta, daily,
+                    ops_asia, ops_lon, ops_ny, pendientes, sl, dist_obj, precio
+                FROM signals
+                ORDER BY received_at DESC
+                LIMIT 100
+            """)
+            rows = cur.fetchall()
+            for row in rows:
+                if row.get("received_at"):
+                    row["received_at"] = row["received_at"].isoformat()
+            return jsonify({"count": len(rows), "signals": rows}), 200
+    except Exception as e:
+        logger.error(f"Error consultando signals: {e}")
+        return jsonify({"error": "Query failed"}), 500
+    finally:
+        conn.close()
+
+# ═══════════════════════════════════════════════════════════
+#  ENTRADA LOCAL (gunicorn no ejecuta este bloque en Railway)
+# ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
