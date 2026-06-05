@@ -2,8 +2,8 @@ import os
 import logging
 import json
 import requests
-import psycopg2
-import psycopg2.extras
+import psycopg
+from psycopg.rows import dict_row
 from flask import Flask, request, jsonify
 from datetime import datetime
 import hmac
@@ -37,7 +37,7 @@ TIPO_EMOJIS = {
 }
 
 # ═══════════════════════════════════════════════════════════
-#  DATABASE — PostgreSQL (nuevo en Fase 1)
+#  DATABASE — PostgreSQL (psycopg3)
 # ═══════════════════════════════════════════════════════════
 
 def get_db_connection():
@@ -45,7 +45,7 @@ def get_db_connection():
     if not DATABASE_URL:
         return None
     try:
-        return psycopg2.connect(DATABASE_URL, connect_timeout=10)
+        return psycopg.connect(DATABASE_URL, connect_timeout=10)
     except Exception as e:
         logger.error(f"Error conectando a DB: {e}")
         return None
@@ -320,7 +320,7 @@ def test():
     success = send_telegram(msg)
     return (jsonify({"status": "ok", "message": "Prueba enviada"}), 200) if success else (jsonify({"status": "error"}), 500)
 
-# ─── NUEVO: endpoint para consultar señales guardadas ────
+# ─── Endpoint para consultar señales guardadas ────────────
 @app.route("/signals", methods=["GET"])
 def list_signals():
     """Retorna las últimas 100 señales guardadas en formato JSON."""
@@ -330,7 +330,7 @@ def list_signals():
     if not conn:
         return jsonify({"error": "Database connection failed"}), 503
     try:
-        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
                 SELECT 
                     id, received_at, tipo_msg, par, direccion, ciclo, kz, tipo,
