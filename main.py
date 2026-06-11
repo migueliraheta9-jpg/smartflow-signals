@@ -5,7 +5,7 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask, request, jsonify
-from datetime import datetime
+from datetime import datetime, timezone
 import hmac
 
 app = Flask(__name__)
@@ -17,6 +17,9 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+VERSION_BACKEND  = "4.0"   # versión de infraestructura (este archivo)
+VERSION_SISTEMA  = "3.4"   # versión del sistema SmartFlow (Pine v3.4)
 
 KZ_EMOJIS = {
     "asia":     "🌏 Asia",
@@ -36,6 +39,10 @@ TIPO_EMOJIS = {
     "liquidez": "💧 Toma de Liquidez",
 }
 
+def utc_now():
+    """Reemplazo moderno de datetime.utcnow() (deprecado en Python 3.12+)."""
+    return datetime.now(timezone.utc)
+
 # ═══════════════════════════════════════════════════════════
 #  DATABASE — PostgreSQL (psycopg3)
 # ═══════════════════════════════════════════════════════════
@@ -50,8 +57,27 @@ def get_db_connection():
         logger.error(f"Error conectando a DB: {e}")
         return None
 
+# ─── Valores semilla de configuración de riesgo ────────────
+# Solo se insertan si la clave NO existe (ON CONFLICT DO NOTHING).
+# Cambiarlos aquí después del primer deploy NO sobreescribe la DB:
+# la fuente de verdad es la tabla risk_config.
+RISK_CONFIG_DEFAULTS = {
+    "riesgo_diario_pct":   "3",      # % de la base — pérdida máxima diaria
+    "rr":                  "2",      # Risk/Reward fijo (1:2)
+    "max_ciclos_dia":      "4",      # ciclos aprobables por día
+    "max_por_cohorte":     "2",      # advertencia de concentración
+    "base_equity":         "",       # se fija con /base (vacío = sin definir)
+    "umbral_subida_pct":   "10",     # base escalonada: sube al superar +10%
+    "umbral_bajada_pct":   "5",      # base escalonada: baja al caer -5%
+    "buffer_pips_default": "5",      # buffer del SL si el símbolo no define uno
+    "hora_cierre_forzado": "16:55",  # hora NY — cierre de toda posición
+    "deadline_pase":       "19:30",  # hora NY — ciclos sin pase se rechazan
+    "modo_operacion":      "senal",  # senal | gate | semiauto | auto
+}
+
 def init_db():
-    """Crea la tabla signals si no existe. Idempotente — seguro de ejecutar múltiples veces."""
+    """Crea/actualiza el esquema completo. Idempotente — seguro de ejecutar
+    múltiples veces. 100% aditivo: nunca borra ni modifica datos existentes."""
     if not DATABASE_URL:
         logger.warning("DATABASE_URL no configurada — persistencia deshabilitada, bot funcionará igual.")
         return
@@ -61,6 +87,7 @@ def init_db():
         return
     try:
         with conn.cursor() as cur:
+            # ── Tabla original (sin cambios) ──────────────
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signals (
                     id              SERIAL PRIMARY KEY,
@@ -89,8 +116,81 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_received_at ON signals(received_at DESC);")
             cur.execute("CREATE INDEX IF NOT EXISTS idx_signals_par ON signals(par);")
+
+            # ── v4.0 — Extensión de signals (columnas nuevas, todas nullable) ──
+            # Las filas existentes quedan intactas; las columnas nacen vacías.
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS ciclo_id      INTEGER;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS gate_decision TEXT;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS outcome       TEXT;")      # tp | sl | tiempo | manual
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS pnl_r         NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS pnl_dinero    NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS mfe_r         NUMERIC;")   # máx excursión a favor (en R)
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS mae_r         NUMERIC;")   # máx excursión en contra (en R)
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS cierre_ts     TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS low_vela      TEXT;")      # low de la vela de señal (Pine)
+
+            # ── v4.0 — Tabla ciclos (flujo de aprobación manual) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS ciclos (
+                    id            SERIAL PRIMARY KEY,
+                    fecha_ciclo   DATE NOT NULL,
+                    par           TEXT NOT NULL,
+                    direccion     TEXT,
+                    tipo_daily    TEXT,
+                    estado        TEXT NOT NULL DEFAULT 'pendiente',  -- pendiente|aprobado|rechazado|expirado
+                    modo_riesgo   TEXT,                               -- tercio_kz | todo_primera
+                    noticia_alta  BOOLEAN DEFAULT FALSE,
+                    razon_rechazo TEXT,
+                    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    decided_at    TIMESTAMPTZ,
+                    UNIQUE (par, fecha_ciclo)
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_ciclos_fecha ON ciclos(fecha_ciclo DESC);")
+
+            # ── v4.0 — Tabla simbolos (registro de activos y cohortes) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS simbolos (
+                    simbolo        TEXT PRIMARY KEY,
+                    cohorte        TEXT,
+                    buffer_pips    NUMERIC DEFAULT 5,
+                    objetivo_macro NUMERIC,
+                    estado         TEXT NOT NULL DEFAULT 'activo',    -- activo | agotado
+                    updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+
+            # ── v4.0 — Tabla risk_config (clave/valor, editable sin deploy) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS risk_config (
+                    clave      TEXT PRIMARY KEY,
+                    valor      TEXT,
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                );
+            """)
+            for clave, valor in RISK_CONFIG_DEFAULTS.items():
+                cur.execute("""
+                    INSERT INTO risk_config (clave, valor)
+                    VALUES (%s, %s)
+                    ON CONFLICT (clave) DO NOTHING;
+                """, (clave, valor))
+
+            # ── v4.0 — Tabla risk_decisions (auditoría del gate) ──
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS risk_decisions (
+                    id        SERIAL PRIMARY KEY,
+                    ts        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    signal_id INTEGER,
+                    ciclo_id  INTEGER,
+                    decision  TEXT,        -- aprobada | rechazada
+                    regla     TEXT,        -- regla que determinó la decisión
+                    detalle   JSONB        -- contexto numérico del momento
+                );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_risk_decisions_ts ON risk_decisions(ts DESC);")
+
             conn.commit()
-            logger.info("Base de datos inicializada — tabla 'signals' lista.")
+            logger.info("Base de datos inicializada — esquema v4.0 listo (signals + ciclos + simbolos + risk_config + risk_decisions).")
     except Exception as e:
         logger.error(f"Error inicializando DB: {e}")
     finally:
@@ -119,12 +219,12 @@ def save_event_to_db(data: dict, tipo_msg: str) -> bool:
                     tipo_msg, par, direccion, ciclo, kz, tipo, fvg_src, calidad,
                     cierre_fuerte, vela_comp, vic_robusta, daily,
                     ops_asia, ops_lon, ops_ny, pendientes,
-                    sl, dist_obj, precio, raw_payload
+                    sl, dist_obj, precio, low_vela, raw_payload
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s,
                     %s, %s, %s, %s,
                     %s, %s, %s, %s,
-                    %s, %s, %s, %s
+                    %s, %s, %s, %s, %s
                 )
             """, (
                 tipo_msg,
@@ -146,6 +246,7 @@ def save_event_to_db(data: dict, tipo_msg: str) -> bool:
                 data.get("sl"),
                 data.get("dist_obj"),
                 data.get("precio"),
+                data.get("low_vela"),   # llegará cuando el Pine se actualice; mientras tanto queda NULL
                 json.dumps(data),
             ))
             conn.commit()
@@ -158,11 +259,11 @@ def save_event_to_db(data: dict, tipo_msg: str) -> bool:
         conn.close()
 
 # Inicializar DB al cargar el módulo (compatible con gunicorn).
-# Se ejecutará una vez por worker. CREATE TABLE IF NOT EXISTS es idempotente.
+# Se ejecutará una vez por worker. Todas las operaciones son idempotentes.
 init_db()
 
 # ═══════════════════════════════════════════════════════════
-#  TELEGRAM — sin cambios respecto a la versión anterior
+#  TELEGRAM
 # ═══════════════════════════════════════════════════════════
 
 def send_telegram(message: str) -> bool:
@@ -197,26 +298,25 @@ def format_signal(data: dict) -> str:
     v_comp     = data.get("vela_comp", "no") == "si"
     v_rob      = data.get("vic_robusta", "no") == "si"
     daily      = data.get("daily", "N/A")
-    ops_a      = data.get("ops_asia", "0")
-    ops_l      = data.get("ops_lon", "0")
-    ops_n      = data.get("ops_ny", "0")
+    ops_a      = safe_int(data.get("ops_asia"))
+    ops_l      = safe_int(data.get("ops_lon"))
+    ops_n      = safe_int(data.get("ops_ny"))
     pend       = data.get("pendientes", "0")
     sl         = data.get("sl", "N/A")
     dist       = data.get("dist_obj", "No definido")
     precio     = data.get("precio", "N/A")
     fvg_src    = data.get("fvg_src", "N/A")
-    rr_ok      = data.get("rr_ok", "no") == "si"
-    now        = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    now        = utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
     dir_cfg  = DIR_CONFIG.get(dir_raw, {"emoji": "⚪", "label": dir_raw.upper(), "arrow": "➡️"})
     kz_label = KZ_EMOJIS.get(kz_raw, f"🕐 {kz_raw.upper()}")
     tipo_lbl = TIPO_EMOJIS.get(tipo_raw, f"📊 {tipo_raw.upper()}")
 
     cal_emoji = "⭐⭐⭐" if calidad == "ALTA" else "⭐⭐" if calidad == "MEDIA" else "⭐"
-    total_ops = int(ops_a) + int(ops_l) + int(ops_n)
+    total_ops = ops_a + ops_l + ops_n
 
     msg = f"""
-🎯 <b>SETUP DETECTADO — SmartFlow v3.0</b>
+🎯 <b>SETUP DETECTADO — SmartFlow v{VERSION_SISTEMA}</b>
 ━━━━━━━━━━━━━━━━━━━━━
 📌 <b>Par:</b> {par}
 {dir_cfg['emoji']} <b>Dirección:</b> {dir_cfg['arrow']} {dir_cfg['label']}
@@ -232,7 +332,7 @@ def format_signal(data: dict) -> str:
 🕯️ <b>Cierre:</b> {"Fuerte ✅" if cf else "Débil ⚠️"}
 🔬 <b>Vela tomadora:</b> {"Comprimida ✅" if v_comp else "Normal"}
 🔬 <b>Vela víctima:</b> {"Robusta ✅" if v_rob else "Normal"}
-📏 <b>Dist. objetivo:</b> {("✅ " if rr_ok else "⚠️ ") + dist}
+📏 <b>Dist. objetivo:</b> {dist}
 ━━━━━━━━━━━━━━━━━━━━━
 📊 <b>KZs del ciclo:</b> 🌏{ops_a} 🌍{ops_l} 🗽{ops_n} | Total: {total_ops} | Pend: {pend}
 ━━━━━━━━━━━━━━━━━━━━━
@@ -244,14 +344,14 @@ def format_signal(data: dict) -> str:
 def format_fin_dia(data: dict) -> str:
     par    = data.get("par", "N/A").upper()
     daily  = data.get("daily", "N/A")
-    ops_a  = data.get("ops_asia", "0")
-    ops_l  = data.get("ops_lon", "0")
-    ops_n  = data.get("ops_ny", "0")
+    ops_a  = safe_int(data.get("ops_asia"))
+    ops_l  = safe_int(data.get("ops_lon"))
+    ops_n  = safe_int(data.get("ops_ny"))
     asia   = data.get("asia", "N/A")
     london = data.get("london", "N/A")
     ny     = data.get("ny", "N/A")
-    total  = int(ops_a) + int(ops_l) + int(ops_n)
-    now    = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    total  = ops_a + ops_l + ops_n
+    now    = utc_now().strftime("%Y-%m-%d %H:%M UTC")
 
     msg = f"""
 ⏰ <b>FIN DEL CICLO DE INVERSIÓN</b>
@@ -312,11 +412,18 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "online", "service": "SmartFlow v3.0", "timestamp": datetime.utcnow().isoformat()}), 200
+    return jsonify({
+        "status": "online",
+        "service": f"SmartFlow Backend v{VERSION_BACKEND} (sistema v{VERSION_SISTEMA})",
+        "timestamp": utc_now().isoformat()
+    }), 200
 
 @app.route("/test", methods=["GET"])
 def test():
-    msg = "🔔 <b>SmartFlow v3.0 — Prueba de conexión</b>\n━━━━━━━━━━━━━━━━━━━━━\n✅ Servidor activo y conectado.\n🤖 Las alertas de TradingView llegarán aquí."
+    msg = (f"🔔 <b>SmartFlow v{VERSION_SISTEMA} — Prueba de conexión</b>\n"
+           "━━━━━━━━━━━━━━━━━━━━━\n"
+           f"✅ Servidor activo y conectado (backend v{VERSION_BACKEND}).\n"
+           "🤖 Las alertas de TradingView llegarán aquí.")
     success = send_telegram(msg)
     return (jsonify({"status": "ok", "message": "Prueba enviada"}), 200) if success else (jsonify({"status": "error"}), 500)
 
@@ -332,10 +439,11 @@ def list_signals():
     try:
         with conn.cursor(row_factory=dict_row) as cur:
             cur.execute("""
-                SELECT 
+                SELECT
                     id, received_at, tipo_msg, par, direccion, ciclo, kz, tipo,
                     fvg_src, calidad, cierre_fuerte, vela_comp, vic_robusta, daily,
-                    ops_asia, ops_lon, ops_ny, pendientes, sl, dist_obj, precio
+                    ops_asia, ops_lon, ops_ny, pendientes, sl, dist_obj, precio,
+                    ciclo_id, gate_decision, outcome, pnl_r, mfe_r, mae_r, low_vela
                 FROM signals
                 ORDER BY received_at DESC
                 LIMIT 100
@@ -344,6 +452,9 @@ def list_signals():
             for row in rows:
                 if row.get("received_at"):
                     row["received_at"] = row["received_at"].isoformat()
+                for k in ("pnl_r", "pnl_dinero", "mfe_r", "mae_r"):
+                    if row.get(k) is not None:
+                        row[k] = float(row[k])
             return jsonify({"count": len(rows), "signals": rows}), 200
     except Exception as e:
         logger.error(f"Error consultando signals: {e}")
@@ -357,5 +468,5 @@ def list_signals():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    logger.info(f"SmartFlow v3.0 iniciando en puerto {port}...")
+    logger.info(f"SmartFlow Backend v{VERSION_BACKEND} iniciando en puerto {port}...")
     app.run(host="0.0.0.0", port=port)
