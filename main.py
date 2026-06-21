@@ -129,6 +129,19 @@ def init_db():
             cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS cierre_ts     TIMESTAMPTZ;")
             cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS low_vela      TEXT;")      # low de la vela de señal (Pine)
 
+            # ── v4.1 — Extensión de signals (estado de ciclo de vida + MT5 + sizing) ──
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS estado           TEXT NOT NULL DEFAULT 'pendiente' CHECK (estado IN ('pendiente','aprobada','en_ejecucion','abierta','cerrada','rechazada_gate','rechazada_sizing','error'));")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS mt5_position_id  BIGINT;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS r_dinero         NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS base_equity_snap NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS reclamo_ts       TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS fill_price       NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS fill_ts          TIMESTAMPTZ;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS sl_real          NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS lote_real        NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS precio_cierre    NUMERIC;")
+            cur.execute("ALTER TABLE signals ADD COLUMN IF NOT EXISTS error_msg        TEXT;")
+
             # ── v4.0 — Tabla ciclos (flujo de aprobación manual) ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS ciclos (
@@ -159,6 +172,13 @@ def init_db():
                     updated_at     TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 );
             """)
+
+            # ── v4.1 — Extensión de simbolos (datos MT5 para sizing) ──
+            cur.execute("ALTER TABLE simbolos ADD COLUMN IF NOT EXISTS mt5_symbol  TEXT;")
+            cur.execute("ALTER TABLE simbolos ADD COLUMN IF NOT EXISTS valor_punto NUMERIC;")
+            cur.execute("ALTER TABLE simbolos ADD COLUMN IF NOT EXISTS lote_min    NUMERIC;")
+            cur.execute("ALTER TABLE simbolos ADD COLUMN IF NOT EXISTS lote_step   NUMERIC;")
+            cur.execute("ALTER TABLE simbolos ADD COLUMN IF NOT EXISTS digits      INTEGER;")
 
             # ── v4.0 — Tabla risk_config (clave/valor, editable sin deploy) ──
             cur.execute("""
