@@ -161,6 +161,35 @@ def init_db():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_ciclos_fecha ON ciclos(fecha_ciclo DESC);")
 
+            # --- Migración aditiva: CHECKs sobre ciclos (idempotente) ---
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'ciclos_estado_check'
+                          AND conrelid = 'ciclos'::regclass
+                    ) THEN
+                        ALTER TABLE ciclos ADD CONSTRAINT ciclos_estado_check
+                            CHECK (estado IN ('pendiente','aprobado','rechazado','expirado'));
+                    END IF;
+                END $$;
+            """)
+            cur.execute("""
+                DO $$
+                BEGIN
+                    IF NOT EXISTS (
+                        SELECT 1 FROM pg_constraint
+                        WHERE conname = 'ciclos_direccion_check'
+                          AND conrelid = 'ciclos'::regclass
+                    ) THEN
+                        ALTER TABLE ciclos ADD CONSTRAINT ciclos_direccion_check
+                            CHECK (direccion IN ('compra','venta'));
+                    END IF;
+                END $$;
+            """)
+            cur.execute("ALTER TABLE ciclos ALTER COLUMN direccion SET NOT NULL;")
+
             # ── v4.0 — Tabla simbolos (registro de activos y cohortes) ──
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS simbolos (
