@@ -252,7 +252,34 @@ def safe_int(val, default=0):
     except (ValueError, TypeError):
         return default
 
-def save_event_to_db(data: dict, tipo_msg: str) -> bool:
+# ─────────────────────────────────────────────────────────────
+# Normalizadores canónicos (Fase 0.1 / 0.2). None-safe, reusables
+# (los reusará el endpoint de ciclos en Fase 1.3).
+#   dir → compra / venta
+#   kz  → asia / london / new york   (alias "ny" → "new york")
+#   par → UPPER  (consistencia de UNIQUE(par,fecha_ciclo) y del match)
+# Valores desconocidos: se devuelven trimmed/lowercased SIN coerción,
+# para que el CHECK de ciclos o el gate los rechacen explícitamente.
+# ─────────────────────────────────────────────────────────────
+_KZ_CANON = {
+    "ny": "new york", "newyork": "new york", "new york": "new york",
+    "asia": "asia", "london": "london", "londres": "london",
+}
+
+def _norm_dir(v):
+    return str(v).strip().lower() if v is not None else None
+
+def _norm_kz(v):
+    if v is None:
+        return None
+    k = str(v).strip().lower()
+    return _KZ_CANON.get(k, k)
+
+def _norm_par(v):
+    return str(v).strip().upper() if v is not None else None
+
+
+def save_event_to_db(data: dict, tipo_msg: str, raw_json: str = None) -> bool:
     """Inserta el evento recibido en la tabla signals.
     Retorna True si tuvo éxito, False si falló.
     NUNCA lanza excepción al caller — el bot debe seguir funcionando aunque la DB falle."""
@@ -296,7 +323,7 @@ def save_event_to_db(data: dict, tipo_msg: str) -> bool:
                 data.get("dist_obj"),
                 data.get("precio"),
                 data.get("low_vela"),   # llegará cuando el Pine se actualice; mientras tanto queda NULL
-                json.dumps(data),
+                raw_json if raw_json is not None else json.dumps(data),
             ))
             conn.commit()
             logger.info(f"Evento '{tipo_msg}' guardado en DB.")
@@ -439,10 +466,30 @@ def webhook():
     logger.info(f"Payload recibido: {data}")
     tipo = data.get("tipo_msg", "signal")
 
+    # ─── 0.3 Validación NO-NULL ANTES del INSERT ───
+    # {"par": null} ya no llega al INSERT ni a los formatters: 400 acá.
+    # Mata el AttributeError → 500 → reintento de TV → fila duplicada.
+    if tipo != "fin_dia":
+        required = ["par", "direccion", "kz", "tipo"]
+        bad = [f for f in required if not str(data.get(f) or "").strip()]
+        if bad:
+            logger.warning(f"Senal rechazada (campos nulos/vacios): {bad}")
+            return jsonify({"error": f"Campos invalidos: {bad}"}), 400
+
+    # raw_payload CRUDO: serializado ANTES de normalizar (valor forense:
+    # preserva el casing exacto que mandó Pine).
+    raw_json = json.dumps(data)
+
+    # ─── 0.1/0.2 Normalización canónica AL RECIBIR (dir / kz / par) ───
+    if tipo != "fin_dia":
+        data["par"]       = _norm_par(data.get("par"))
+        data["direccion"] = _norm_dir(data.get("direccion"))
+        data["kz"]        = _norm_kz(data.get("kz"))
+
     # ─── Guardado en DB ANTES de Telegram ──────────────────
     # Doble try/except — la DB nunca puede romper el envío a Telegram
     try:
-        save_event_to_db(data, tipo)
+        save_event_to_db(data, tipo, raw_json=raw_json)
     except Exception as e:
         logger.error(f"Error inesperado al guardar en DB: {e}")
     # ───────────────────────────────────────────────────────
@@ -450,10 +497,6 @@ def webhook():
     if tipo == "fin_dia":
         message = format_fin_dia(data)
     else:
-        required = ["par", "direccion", "kz", "tipo"]
-        missing = [f for f in required if f not in data]
-        if missing:
-            return jsonify({"error": f"Campos faltantes: {missing}"}), 400
         message = format_signal(data)
 
     success = send_telegram(message)
