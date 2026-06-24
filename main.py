@@ -5,7 +5,8 @@ import requests
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask, request, jsonify
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date, timedelta
+from zoneinfo import ZoneInfo
 import hmac
 
 app = Flask(__name__)
@@ -189,6 +190,14 @@ def init_db():
                 END $$;
             """)
             cur.execute("ALTER TABLE ciclos ALTER COLUMN direccion SET NOT NULL;")
+
+            # ── v4.2 — Campos de registro del ciclo (aditivo, nullable) ──
+            # Datos que manda el Pine v3.5 en la alerta de ciclo. Sin lógica
+            # asociada todavía: puro registro para análisis futuro
+            # (min/max semanal, invalidación por proyección).
+            cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS liq_high   NUMERIC;")
+            cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS liq_low    NUMERIC;")
+            cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS proyeccion NUMERIC;")
 
             # ── v4.0 — Tabla simbolos (registro de activos y cohortes) ──
             cur.execute("""
@@ -450,6 +459,99 @@ def format_fin_dia(data: dict) -> str:
 #  ENDPOINTS
 # ═══════════════════════════════════════════════════════════
 
+# ─────────────────────────────────────────────────────────────
+# FASE 1.3 — Cálculo de fecha_ciclo y handler de ciclo
+# ─────────────────────────────────────────────────────────────
+_NY_TZ = ZoneInfo("America/New_York")
+
+def fecha_ciclo(bar_time_ms) -> date:
+    """Calcula el DATE del día de trading sobre el bar_time del Pine.
+    Ventana del día sintético: [17:00 NY, +24h). Una barra con hora NY >= 17
+    pertenece al día siguiente; < 17 al mismo día. DST lo maneja ZoneInfo.
+    bar_time_ms: epoch UTC en milisegundos (string o int desde el Pine)."""
+    ms = int(bar_time_ms)
+    dt_utc = datetime.fromtimestamp(ms / 1000, tz=timezone.utc)
+    dt_ny = dt_utc.astimezone(_NY_TZ)
+    base = dt_ny.date()
+    return base + timedelta(days=1) if dt_ny.hour >= 17 else base
+
+
+def _to_num(v):
+    """Castea texto del Pine a float; None si no parsea o es placeholder."""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if s == "" or s.upper() in ("N/A", "NA"):
+        return None
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def handle_ciclo(data: dict):
+    """Procesa una alerta de ciclo (tipo_msg='ciclo') del Pine v3.5.
+    Inserta/actualiza en ciclos. Idempotente vía UNIQUE(par,fecha_ciclo):
+    si el ciclo ya existe y sigue 'pendiente', actualiza; si ya fue decidido,
+    el reenvío se ignora (protege la decisión manual de Telegram).
+    NUNCA lanza al caller — el webhook responde 200 igual."""
+    par = _norm_par(data.get("par"))
+    direccion = _norm_dir(data.get("direccion"))
+
+    # Validación no-null (mismo criterio que la rama signal)
+    if not par or not direccion:
+        logger.warning(f"Ciclo rechazado (par/direccion nulos): par={par} dir={direccion}")
+        return jsonify({"error": "Ciclo: par/direccion invalidos"}), 400
+    if direccion not in ("compra", "venta"):
+        logger.warning(f"Ciclo rechazado (direccion fuera de CHECK): {direccion}")
+        return jsonify({"error": "Ciclo: direccion debe ser compra/venta"}), 400
+
+    bar_time = data.get("bar_time")
+    if not bar_time:
+        logger.warning("Ciclo rechazado (sin bar_time)")
+        return jsonify({"error": "Ciclo: falta bar_time"}), 400
+    try:
+        fc = fecha_ciclo(bar_time)
+    except (ValueError, TypeError, OSError) as e:
+        logger.error(f"Ciclo rechazado (bar_time invalido '{bar_time}'): {e}")
+        return jsonify({"error": "Ciclo: bar_time invalido"}), 400
+
+    tipo_daily = data.get("criterio")
+    liq_high   = _to_num(data.get("liq_high"))
+    liq_low    = _to_num(data.get("liq_low"))
+    proyeccion = _to_num(data.get("proyeccion"))
+
+    if not DATABASE_URL:
+        logger.warning("Ciclo no guardado: DATABASE_URL ausente.")
+        return jsonify({"status": "ok", "warning": "sin DB"}), 200
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Ciclo no guardado: conexión DB falló.")
+        return jsonify({"status": "ok", "warning": "DB no disponible"}), 200
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO ciclos (par, direccion, fecha_ciclo, tipo_daily,
+                                    liq_high, liq_low, proyeccion, estado)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, 'pendiente')
+                ON CONFLICT (par, fecha_ciclo) DO UPDATE SET
+                    direccion  = EXCLUDED.direccion,
+                    tipo_daily = EXCLUDED.tipo_daily,
+                    liq_high   = EXCLUDED.liq_high,
+                    liq_low    = EXCLUDED.liq_low,
+                    proyeccion = EXCLUDED.proyeccion
+                WHERE ciclos.estado = 'pendiente';
+            """, (par, direccion, fc, tipo_daily, liq_high, liq_low, proyeccion))
+            conn.commit()
+            logger.info(f"Ciclo guardado: {par} {direccion} {fc} ({tipo_daily})")
+            return jsonify({"status": "ok", "ciclo": f"{par} {direccion} {fc}"}), 200
+    except Exception as e:
+        logger.error(f"Error guardando ciclo: {e}")
+        return jsonify({"status": "error"}), 500
+    finally:
+        conn.close()
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     if not validate_secret(request):
@@ -465,6 +567,11 @@ def webhook():
 
     logger.info(f"Payload recibido: {data}")
     tipo = data.get("tipo_msg", "signal")
+
+    # ─── FASE 1.3 — Rama de ciclo (corta temprano: no toca signals ni la
+    # validación 0.3, que exige kz/tipo que el ciclo no manda) ───
+    if tipo == "ciclo":
+        return handle_ciclo(data)
 
     # ─── 0.3 Validación NO-NULL ANTES del INSERT ───
     # {"par": null} ya no llega al INSERT ni a los formatters: 400 acá.
