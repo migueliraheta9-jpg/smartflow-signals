@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
 WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "")
 DATABASE_URL     = os.environ.get("DATABASE_URL", "")
 TELEGRAM_URL     = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -374,6 +375,94 @@ def validate_secret(req) -> bool:
         return True
     return hmac.compare_digest(req.headers.get("X-Webhook-Secret", ""), WEBHOOK_SECRET)
 
+# ─────────────────────────────────────────────────────────────
+# FASE 1.4 — Telegram inbound: helpers de callbacks de ciclos
+# ─────────────────────────────────────────────────────────────
+
+def tg_answer_callback(callback_query_id, text="") -> bool:
+    """Responde un callback_query (toast efímero). Estilo idéntico a send_telegram."""
+    if not TELEGRAM_TOKEN:
+        logger.error("tg_answer_callback: TELEGRAM_TOKEN no definido.")
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+            json={"callback_query_id": callback_query_id, "text": text},
+            timeout=10,
+        )
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error answerCallbackQuery: {e}")
+        return False
+
+
+def tg_edit_message(chat_id, message_id, text, reply_markup) -> bool:
+    """Edita un mensaje existente (editMessageText, parse_mode=HTML)."""
+    if not TELEGRAM_TOKEN:
+        logger.error("tg_edit_message: TELEGRAM_TOKEN no definido.")
+        return False
+    try:
+        payload = {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "text": text,
+            "parse_mode": "HTML",
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+            json=payload,
+            timeout=10,
+        )
+        r.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.error(f"Error editMessageText: {e}")
+        return False
+
+
+def _build_ciclo_keyboard(rows):
+    """InlineKeyboardMarkup: una fila [✅ N][❌ N] por ciclo pendiente.
+    Los ciclos ya decididos no llevan botones. rows: dicts con id+estado."""
+    keyboard = []
+    for r in rows:
+        if r.get("estado") != "pendiente":
+            continue
+        cid = r["id"]
+        keyboard.append([
+            {"text": f"✅ {cid}", "callback_data": f"ciclo:{cid}:ap"},
+            {"text": f"❌ {cid}", "callback_data": f"ciclo:{cid}:rc"},
+        ])
+    return {"inline_keyboard": keyboard}
+
+
+def _render_reporte(ciclos_rows):
+    """Texto HTML del reporte de ciclos del día. Marca ✅/❌ los decididos."""
+    hoy = utc_now().astimezone(_NY_TZ).date()
+    aprobados  = sum(1 for r in ciclos_rows if r.get("estado") == "aprobado")
+    pendientes = sum(1 for r in ciclos_rows if r.get("estado") == "pendiente")
+    lineas = [
+        f"📋 <b>CICLOS — {hoy}</b>",
+        f"Aprobados: {aprobados}/4 | Pendientes: {pendientes}",
+        "━━━━━━━━━━━━━━━━━━━━━",
+    ]
+    for i, r in enumerate(ciclos_rows, start=1):
+        estado = r.get("estado")
+        marca = "✅" if estado == "aprobado" else "❌" if estado == "rechazado" else "•"
+        par = r.get("par", "N/A")
+        direccion = (r.get("direccion") or "").upper()
+        tipo_daily = r.get("tipo_daily") or "—"
+        liq_high = r.get("liq_high")
+        liq_low = r.get("liq_low")
+        proy = r.get("proyeccion")
+        lineas.append(
+            f"{marca} <b>{i}. {par}</b> {direccion} | {tipo_daily}\n"
+            f"     liq: {liq_low}–{liq_high} | proy: {proy}"
+        )
+    return "\n".join(lineas)
+
 def format_signal(data: dict) -> str:
     par        = data.get("par", "N/A").upper()
     dir_raw    = data.get("direccion", "").lower()
@@ -661,6 +750,126 @@ def list_signals():
         return jsonify({"error": "Query failed"}), 500
     finally:
         conn.close()
+
+# ─────────────────────────────────────────────────────────────
+# FASE 1.4 — Telegram inbound: receptor de callbacks de aprobación
+# ─────────────────────────────────────────────────────────────
+@app.route("/telegram", methods=["POST"])
+def telegram_webhook():
+    # (a) Validación FAIL-CLOSED del secret token de Telegram.
+    #     A diferencia de /webhook, si no hay secret configurado se RECHAZA.
+    if not TELEGRAM_WEBHOOK_SECRET:
+        logger.warning("/telegram: TELEGRAM_WEBHOOK_SECRET no configurado — rechazo (fail-closed).")
+        return jsonify({"error": "Unauthorized"}), 401
+    token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if not hmac.compare_digest(token, TELEGRAM_WEBHOOK_SECRET):
+        logger.warning("/telegram: secret token inválido.")
+        return jsonify({"error": "Unauthorized"}), 401
+
+    update = request.get_json(silent=True) or {}
+    cq = update.get("callback_query")
+    if not cq:
+        return ("", 200)  # otros updates (mensajes, etc.): ignorar
+
+    # (i) Todo el cuerpo en try/except que loguee y devuelva 200:
+    #     Telegram reintenta ante !=200; un bug de formato no debe crear loops.
+    try:
+        # (b) Filtro por chat autorizado.
+        msg = cq.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = chat.get("id")
+        if str(chat_id) != str(TELEGRAM_CHAT_ID):
+            logger.warning(f"/telegram: chat no autorizado: {chat_id}")
+            return ("", 200)
+
+        # (c) Parseo de callback_data "ciclo:<id>:<ap|rc>".
+        parts = (cq.get("data") or "").split(":")
+        if len(parts) != 3 or parts[0] != "ciclo":
+            tg_answer_callback(cq.get("id"), "Callback no reconocido")
+            return ("", 200)
+        ciclo_id = safe_int(parts[1], 0)
+        accion = parts[2]
+        if ciclo_id <= 0 or accion not in ("ap", "rc"):
+            tg_answer_callback(cq.get("id"), "Callback inválido")
+            return ("", 200)
+
+        message_id = msg.get("message_id")
+
+        if not DATABASE_URL:
+            tg_answer_callback(cq.get("id"), "Sin DB")
+            return ("", 200)
+        conn = get_db_connection()
+        if not conn:
+            tg_answer_callback(cq.get("id"), "DB no disponible")
+            return ("", 200)
+        try:
+            with conn.cursor(row_factory=dict_row) as cur:
+                # (d) Leer created_at + fecha_ciclo del ciclo para las guardias.
+                cur.execute("SELECT id, created_at, fecha_ciclo, estado FROM ciclos WHERE id = %s", (ciclo_id,))
+                ciclo = cur.fetchone()
+                if not ciclo:
+                    tg_answer_callback(cq.get("id"), "Ciclo inexistente")
+                    return ("", 200)
+                fc = ciclo["fecha_ciclo"]
+
+                # (e) GUARDIA deadline: 19:30 NY del día en que LLEGÓ el ciclo (created_at).
+                ahora_ny = utc_now().astimezone(_NY_TZ)
+                llegada_ny = ciclo["created_at"].astimezone(_NY_TZ)
+                deadline = datetime(llegada_ny.year, llegada_ny.month, llegada_ny.day, 19, 30, tzinfo=_NY_TZ)
+                if ahora_ny > deadline:
+                    tg_answer_callback(cq.get("id"), "Expirado, pasó el deadline 19:30 NY")
+                    return ("", 200)
+
+                # (f) GUARDIA max-4 aprobados del día (solo en 'ap').
+                if accion == "ap":
+                    cur.execute(
+                        "SELECT count(*) AS n FROM ciclos WHERE fecha_ciclo = %s AND estado = 'aprobado'",
+                        (fc,),
+                    )
+                    if cur.fetchone()["n"] >= 4:
+                        tg_answer_callback(cq.get("id"), "Ya tenés 4 ciclos aprobados")
+                        return ("", 200)
+
+                # (g) UPDATE atómico: solo transiciona si sigue 'pendiente'.
+                nuevo_estado = "aprobado" if accion == "ap" else "rechazado"
+                cur.execute(
+                    "UPDATE ciclos SET estado = %s, decided_at = %s WHERE id = %s AND estado = 'pendiente'",
+                    (nuevo_estado, utc_now(), ciclo_id),
+                )
+                if cur.rowcount == 0:
+                    conn.commit()
+                    tg_answer_callback(cq.get("id"), "Ese ciclo ya estaba decidido")
+                    return ("", 200)
+                conn.commit()
+
+                # (h) Toast de confirmación + re-render del mensaje.
+                tg_answer_callback(cq.get("id"), "Aprobado ✅" if accion == "ap" else "Rechazado ❌")
+
+                # IDs de ciclo presentes en ESTE mensaje (de su reply_markup).
+                ids = []
+                for fila in (msg.get("reply_markup") or {}).get("inline_keyboard", []):
+                    for btn in fila:
+                        bp = (btn.get("callback_data") or "").split(":")
+                        if len(bp) == 3 and bp[0] == "ciclo":
+                            bid = safe_int(bp[1], 0)
+                            if bid > 0 and bid not in ids:
+                                ids.append(bid)
+                if ciclo_id not in ids:
+                    ids.append(ciclo_id)
+
+                cur.execute(
+                    """SELECT id, par, direccion, tipo_daily, liq_high, liq_low, proyeccion, estado
+                       FROM ciclos WHERE id = ANY(%s) ORDER BY created_at""",
+                    (ids,),
+                )
+                rows = cur.fetchall()
+                tg_edit_message(chat_id, message_id, _render_reporte(rows), _build_ciclo_keyboard(rows))
+                return ("", 200)
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.error(f"/telegram error: {e}")
+        return ("", 200)
 
 # ═══════════════════════════════════════════════════════════
 #  ENTRADA LOCAL (gunicorn no ejecuta este bloque en Railway)
