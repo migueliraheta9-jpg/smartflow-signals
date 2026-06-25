@@ -198,6 +198,7 @@ def init_db():
             cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS liq_high   NUMERIC;")
             cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS liq_low    NUMERIC;")
             cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS proyeccion NUMERIC;")
+            cur.execute("ALTER TABLE ciclos ADD COLUMN IF NOT EXISTS notificado_at TIMESTAMPTZ;")
 
             # ── v4.0 — Tabla simbolos (registro de activos y cohortes) ──
             cur.execute("""
