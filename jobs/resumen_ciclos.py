@@ -3,11 +3,18 @@ Cron de resumen de ciclos — servicio Railway separado (mismo repo, distinto st
 Lee ciclos sin notificar, manda UN reporte consolidado con teclado, marca notificado_at.
 Reusa helpers validados de main.py. import main dispara init_db() idempotente (L350) — OK.
 """
+import os
+import sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests                       # alinear con tg_edit_message/send_telegram
 from psycopg.rows import dict_row
+
+# Raíz del repo en sys.path: el cron arranca con CWD en jobs/, no en /app donde
+# vive main.py. Sin esto, import main → ModuleNotFoundError. Sube dos niveles
+# desde este archivo (jobs/resumen_ciclos.py → jobs/ → raíz).
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import main                           # trae helpers + constantes; init_db idempotente
 
