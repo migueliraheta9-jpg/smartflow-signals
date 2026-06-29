@@ -431,9 +431,10 @@ def _build_ciclo_keyboard(rows):
         if r.get("estado") != "pendiente":
             continue
         cid = r["id"]
+        par = r["par"]
         keyboard.append([
-            {"text": f"✅ {cid}", "callback_data": f"ciclo:{cid}:ap"},
-            {"text": f"❌ {cid}", "callback_data": f"ciclo:{cid}:rc"},
+            {"text": f"✅ {par}", "callback_data": f"ciclo:{cid}:ap"},
+            {"text": f"❌ {par}", "callback_data": f"ciclo:{cid}:rc"},
         ])
     return {"inline_keyboard": keyboard}
 
